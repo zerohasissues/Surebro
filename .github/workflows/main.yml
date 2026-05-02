@@ -1,0 +1,126 @@
+name: Download file
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'Direct link to the file you want to download'
+        required: true
+        type: string
+
+      zip_password:
+        description: 'Password for the ZIP archive'
+        required: true
+        type: string
+
+      archive_name:
+        description: 'Name of the archive (without .7z extension)'
+        required: false
+        default: 'archive'
+        type: string
+
+      batch_size:
+        description: 'Number of archive parts to push per commit'
+        required: false
+        default: '10'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-split:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install 7zip
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+
+      - name: Clean up old archive files (if any)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "Checking for existing .7z archives..."
+          found_old=false
+          for f in *.7z*; do
+            if [ -f "$f" ]; then
+              echo "Deleting old archive file: $f"
+              rm -f "$f"
+              found_old=true
+            fi
+          done
+
+          if [ "$found_old" = true ]; then
+            git add -A
+            git commit -m "Clean up previous archive files before new download"
+            git push
+          else
+            echo "No old archives found."
+          fi
+
+      - name: Download file from link
+        run: |
+          curl -L --fail --retry 3 -o downloaded_file "${{ github.event.inputs.file_url }}"
+          ls -lh downloaded_file
+
+      - name: Extract original file name (optional)
+        run: |
+          ORIGINAL_NAME=$(basename "${{ github.event.inputs.file_url }}" | cut -d '?' -f1)
+          [ -z "$ORIGINAL_NAME" ] && ORIGINAL_NAME="downloaded_file"
+          echo "ORIGINAL_NAME=$ORIGINAL_NAME" >> $GITHUB_ENV
+
+      - name: Create password-protected multi-part archive (each part 95 MB)
+        run: |
+          ARCHIVE_NAME="${{ github.event.inputs.archive_name }}"
+          7z a -p"${{ github.event.inputs.zip_password }}" -mhe=on -mx=3 -v95m "${ARCHIVE_NAME}.7z" downloaded_file
+
+      - name: Delete original file
+        run: rm -f downloaded_file
+
+      - name: Commit and push chunks step-by-step
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          ARCHIVE_NAME="${{ github.event.inputs.archive_name }}"
+          chunks=(${ARCHIVE_NAME}.7z.*)
+          total=${#chunks[@]}
+
+          batch_size="${{ github.event.inputs.batch_size }}"
+          batch_size=$((batch_size))
+
+          start=0
+
+          while [ $start -lt $total ]; do
+            end=$((start + batch_size - 1))
+            [ $end -ge $total ] && end=$((total - 1))
+
+            echo "Pushing chunks $start to $end ..."
+
+            # Add this batch of chunks
+            for i in $(seq $start $end); do
+              git add "${chunks[$i]}"
+            done
+
+            git commit -m "Add chunks $((start+1))-$((end+1)) of $total"
+
+            # Retry push up to 5 times if needed
+            for attempt in {1..5}; do
+              if git push; then
+                echo "Push successful"
+                break
+              else
+                echo "Push failed (attempt $attempt), retrying in 10 seconds..."
+                sleep 10
+              fi
+            done
+
+            start=$((end + 1))
+            sleep 5
+          done
